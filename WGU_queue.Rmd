@@ -1,0 +1,146 @@
+---
+title: "WGU_Queue_Data"
+author: "Justin Howard"
+date: "November 18, 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Loading Data
+
+```{r exploring structure}
+library(tswge) # a handy package for time series analysis
+MSDA_data = read.csv('MSDAsubmissions10.1.17_11.18.19.csv', header = T)
+head(MSDA_data)
+str(MSDA_data)
+head(MSDA_data$ACTIVITY_STATUS_DATE)
+str(MSDA_data$ACTIVITY_STATUS_DATE)
+```
+## Data Structure
+Data is not grouped by date.
+```{r restructuring for time series analysis}
+MSDA_data2 = MSDA_data[order(MSDA_data$ACTIVITY_STATUS_DATE),]
+# standardizing time to avoid CST, CDT time difference errors
+Sys.setenv(TZ = 'GMT')
+# creating univariate series
+MSDA_t = strptime(MSDA_data2$ACTIVITY_STATUS_DATE, "%Y-%m-%d %H:%M:%S")
+```
+## Analysis of time between Data Analytics submissions
+```{r}
+time.lapses = c()
+for (k in 1:length(MSDA_t)-1) {
+  diff = abs(as.numeric(difftime(MSDA_t[k], MSDA_t[k+1], units = 'days')))
+  time.lapses = c(time.lapses, diff)
+}
+summary(time.lapses)
+head(time.lapses)
+sum(is.na(time.lapses))
+length(time.lapses) #9212
+```
+
+```{r autocorrelation scructure}
+plotts.sample.wge(time.lapses)
+```
+
+## Initial Observations
+### Realization
+There does appear to be a trend in the duration of time between MSDA submissions
+### Auto-Correlation Structure
+The ACF structure resembles white noise
+### Spectral Density
+The system frequency rapidly decends from zero, also indicating that this series is white noise
+### Implications for Analysis
+The assumption of serial correlation is dubious at best. Linear regression will probably yield better results in predicting the average tiem between submissions.
+
+```{r Getting Counts}
+MSDA_data2$Hourly <- as.character( round(MSDA_t , units = "hours" ) )
+
+hour_counts = aggregate( MSDA_data2$ACTIVITY_STATUS_DATE , by = list(MSDA_data2$Hourly) , length )
+head(hour_counts)
+plot(hour_counts$x, type = 'l', main = "Hourly Queue Activity")
+
+MSDA_data2$Daily <- as.character( round(MSDA_t , units = "days" ) )
+daily_counts = aggregate( MSDA_data2$ACTIVITY_STATUS_DATE , by = list(MSDA_data2$Daily) , length )
+plot(daily_counts$x, type = 'l', main = 'Daily Queue Activity')
+abline(v=235, col = 'red')
+abline(v=185, col = 'red')
+```
+A very unusual spike in the data. What happened around day 200? 
+
+```{r Univariate Exploratory Analysis}
+library(tswge)
+plotts.sample.wge(daily_counts$x)
+```
+Prominent spectral density peaks 
+0, .08, .14, .28
+Autocorrelation structure 
+Significant lag = 7 --> weekly season
+```{r Univariate model identification}
+daily_q = daily_counts$x
+s7 = artrans.wge(daily_q, phi.tr = c(rep(0,6),1))
+```
+An s=7 seasonal model seems to fit nicely. We will model the residuals
+```{r Model ID con}
+aic5.wge(s7, p = 0:7, q = 0:3)
+```
+
+AIC5 suggests an ARMA(5,2), the max allowed. We are missing something.
+```{r yearly season}
+s364 = artrans.wge(daily_q, phi.tr = c(rep(0,363),1))
+aic5.wge(s364)
+```
+Trying AIC suggestion of s364 residuals.
+```{r}
+ARMA1.1 = est.arma.wge(s364, p = 1, q=1)
+
+#sim1 = gen.aruma.wge(length(daily_q), s = 364, phi = ARMA1.1$phi, theta = ARMA1.1$theta, vara = ARMA1.1$avar)
+```
+generating realizations didn't work for some reason.
+```{r forecast}
+f1 = fore.aruma.wge(daily_q, phi = ARMA1.1$phi, ARMA1.1$theta, s = 364, n.ahead = 365, lastn = T, limits = F)
+```
+```{r ASE}
+n = length(daily_q)
+x = n-365
+yr.test = daily_q[416:n]
+plot(yr.test, type = 'l', main = 'ARIMA(1,0,1) s = 364 Forecast')
+lines(f1$f, type = 'l', col = 'red')
+mean((daily_q[416:n] - f1$f)^2)
+sqrt((mean((daily_q[416:n] - f1$f)^2))/365)
+
+f1residuals = f1$resid[366:780]
+acf(f1residuals)
+plot(f1residuals, type = 'l')
+```
+Although the residuals appear to be white noise, the ARIMA(1,0,1) model forecast doesn't capture the trend well. We can try differencing.
+
+```{r DIFFERENCING}
+Sys.setenv(TZ = 'GMT') # have to set to GMT otherwise positx provides different time zones
+day1 = as.POSIXct(daily_counts$Group.1[1])
+day1
+
+last.d = as.POSIXct(daily_counts$Group.1[779])
+last.d
+
+
+dif = artrans.wge(daily_q, 1)
+dif.s7 = artrans.wge(dif, phi.tr = c(rep(0,364),1))
+aic5.wge(dif.s7, p=0:20)
+phi = est.arma.wge(dif.s7, p=15, q=2)
+f2 = fore.aruma.wge(daily_q, d = 1, s = 364, phi = phi$phi, theta = phi$theta, lastn = T, n.ahead = 364, limits = F)
+```
+```{r evaluating differenced model}
+#plot(yr.test, type = 'l', main = 'ARIMA(1,0,1) s = 7 Forecast')
+#lines(f2$f, type = 'l', col = 'red') 
+mean((daily_q[416:n] - f2$f)^2) # 73.22, a little worse
+sqrt((mean((daily_q[416:n] - f1$f)^2))/365)
+
+f2residuals = f2$resid[366:780]
+acf(f2residuals)
+plot(f1residuals, type = 'l')
+```
+The differenced model appears to be white noise, and the ASE of the forecasts is slightly higher than the original model.
+We are still failing to predict the rising trend well. We need to include time as a variable.
