@@ -1,0 +1,846 @@
+---
+title: "MSDA_Queue_Prediction"
+author: "Justin Howard"
+date: "November 25, 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r data loading}
+q2016 = read.csv('2016.csv', header = T)
+q2017 = read.csv('2017.csv', header = T)
+q2018 = read.csv('2018.csv', header = T)
+q2019 = read.csv('2019.csv', header = T)
+
+val = read.csv('2019validation.csv', header = T)
+val = val[4673:5361,]
+Sys.setenv(TZ = 'GMT')
+
+q2016$submit.time = as.POSIXct(strptime(q2016$Student.Submit.Date, "%m/%d/%Y %H:%M"))
+q2016$ev.start = as.POSIXct(strptime(q2016$EV.Grade.Start.Date, "%m/%d/%Y %H:%M"))
+q2016$ev.end = as.POSIXct(strptime(q2016$EV.Release.Date, "%m/%d/%Y %H:%M"))
+q2016$submit.time[1]
+q2016$ev.start[1]
+q2016$ev.end[1]
+
+q2017$submit.time = as.POSIXct(strptime(q2017$Student.Submit.Date, "%m/%d/%Y %H:%M"))
+q2017$ev.start = as.POSIXct(strptime(q2017$EV.Grade.Start.Date, "%m/%d/%Y %H:%M"))
+q2017$ev.end = as.POSIXct(strptime(q2017$EV.Release.Date, "%m/%d/%Y %H:%M"))
+q2017$submit.time[1]
+q2017$ev.start[1]
+q2017$ev.end[1]
+
+q2018$submit.time = as.POSIXct(strptime(q2018$Student.Submit.Date, "%m/%d/%Y %H:%M"))
+q2018$ev.start = as.POSIXct(strptime(q2018$EV.Grade.Start.Date, "%m/%d/%Y %H:%M"))
+q2018$ev.end = as.POSIXct(strptime(q2018$EV.Release.Date, "%m/%d/%Y %H:%M"))
+q2018$submit.time[1]
+q2018$ev.start[1]
+q2018$ev.end[1]
+
+q2019$submit.time = as.POSIXct(strptime(q2019$Student.Submit.Date, "%m/%d/%Y %H:%M"))
+q2019$ev.start = as.POSIXct(strptime(q2019$EV.Grade.Start.Date, "%m/%d/%Y %H:%M"))
+q2019$ev.end = as.POSIXct(strptime(q2019$EV.Release.Date, "%m/%d/%Y %H:%M"))
+q2019$submit.time[1]
+q2019$ev.start[1]
+q2019$ev.end[1]
+
+val$submit.time = as.POSIXct(strptime(val$Student.Submit.Date, "%m/%d/%Y %H:%M"))
+val$ev.start = as.POSIXct(strptime(val$EV.Grade.Start.Date, "%m/%d/%Y %H:%M"))
+val$ev.end = as.POSIXct(strptime(val$EV.Release.Date, "%m/%d/%Y %H:%M"))
+val$submit.time[1]
+val$ev.start[1]
+val$ev.end[1]
+```
+```{r merging datasets}
+allq = rbind(q2016, q2017, q2018, q2019, val)
+dim(allq)
+allq = allq[order(allq$submit.time),]
+head(allq$submit.time)
+```
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r cleaning days}
+### getting daily counts 
+
+# rounding all submit times to nearest day
+allq$Days = as.Date(allq$submit.time, format = '%m/%d/%Y')
+head(allq$Days)
+# getting a count of days to make a complete list of calendar days for the series
+total_days = seq.Date(min(as.Date(allq$Days)), max(as.Date(allq$Days)), 'day')
+
+length(total_days) # 1274 unique days in this timeframe
+
+# counting submissions for each day in the complete day list
+daily_counts = aggregate( allq$submit.time, by = list(allq$Days) , length )
+length(daily_counts$Group.1) # 1107 unique dates
+daily_counts
+length(total_days) - length(daily_counts$Group.1) # difference of 167 days
+
+total_days = data.frame(total_days)
+day_gaps = merge(x = total_days[,1], y = daily_counts$Group.1, all.x = T)
+length(day_gaps$x)
+######################## FINDING MISSING DATES IN THE SERIES
+library(tidyverse)
+daily_counts = daily_counts %>%
+  mutate(Group.1 = as.Date(Group.1)) %>%
+  complete(Group.1 = seq.Date(min(Group.1), max(Group.1), by="day"))
+```
+
+```{r removing missing data}
+# observation 385 marks the point where all days are accounted for in the series.
+subset1 = allq[385:20516,] # whole dataset
+
+# creating a list of dates to aggregate by that starts with the first day in the complete series
+total_days2 = total_days %>% filter(total_days >= '2017-04-06')
+
+# remaking daily_counts to reflect new dataset
+daily_counts = aggregate( subset1$submit.time, by = list(subset1$Days) , length )
+colnames(daily_counts) = c('Date', 'submission_count')
+plot(y = daily_counts$submission_count,x = daily_counts$Date, type = 'l', 
+     main = 'MSDA Daily Queue Counts: 02/21/2017 - 12/11/2019',
+     ylab = 'Daily Submission Count',
+     xlab = 'Time')
+
+```
+```{r exploring the response}
+plotts.sample.wge(daily_counts$submission_count)
+parzen.wge(daily_counts$submission_count, trunc = 900)
+```
+The autocorrelation structure indicates the presence of a seasonal component with a strong peak at .14, reflecting the autocorrelation structure's peaks every 7th lag. A secondary peak at .28, which is simply a bi-weekly autocorrelation. To examine the spectral density for the presence of a daily system frequency at .0027, the truncation point of the Parzen window was raised to 900. This examination confirmed the presence of a dominant system frequency at approximately .0027, confirming the presence of a (1/365) daily period. This process has a daily, weekly, and biweekly frequency. Due to calendar error, a 364 day season will be used to model the daily frequency.   
+```{r univariate forecast as benchmark}
+#dif = artrans.wge(daily_counts2$x, 1)
+#aic5.wge(dif, p = 0:28)
+s364 = artrans.wge(daily_counts$submission_count, phi.tr = c(rep(0,363),1))
+parzen.wge(s364)
+```
+```{r modeling residuals}
+#aic5.wge(s364, p = 0:29, q = 0:2)
+s364.est = est.arma.wge(s364, p = 21, q = 1)
+plot(s364.est$res, type = 'l', main = 'ARUMA(21,0,2), s = 364 Residuals')
+s364.est$avar
+aic5.wge(s364.est$res)
+```
+```{r univariate forecasting}
+f1 = fore.aruma.wge(daily_counts$submission_count, s= 364, phi = s364.est$phi, theta = s364.est$theta, lastn = T, n.ahead = 31, limits = F)
+n = length(daily_counts$submission_count)
+n-365
+year = daily_counts$submission_count[592:n]
+length(year)
+t = 926:956
+mean((daily_counts$submission_count[t]- f1$f)^2) # ASE 92.40
+sqrt(mean((daily_counts$submission_count[t]- f1$f)^2)) #RMSE 9.61
+```
+Now that a benchmark is established, a log transformation of the data will be performed to see if forecasts improve.
+
+To improve the forecast accruacy, the coefficients will be estimated using log transformed data and applied to the non-transformed realization to create the 31-day forecast.
+```{r log transformation}
+daily_counts$log_sub_count = log(daily_counts$submission_count)
+l.s364 = artrans.wge(daily_counts$log_sub_count, phi.tr = c(rep(0,363),1))
+
+l.s364.est = est.arma.wge(l.s364, p = 21, q = 2)
+l.f1 = fore.aruma.wge(daily_counts$submission_count, s= 364, phi = l.s364.est$phi, theta = l.s364.est$theta, lastn = T, n.ahead = 31, limits = F)
+n = length(daily_counts$submission_count)
+n-365
+year = daily_counts$submission_count[592:n]
+length(year)
+t = 926:956
+mean((daily_counts$submission_count[t]- l.f1$f)^2) # ASE 74.84
+sqrt(mean((daily_counts$submission_count[t]- l.f1$f)^2)) # RMSE 8.65
+```
+Using the log transformed data to generate phi estimates provides more robust predictions.
+```{r}
+plot(y= daily_counts$submission_count[t], x = daily_counts$Date[t], type = 'l', 
+     main = '31-Day Predictions using Log Transformed Data',
+     ylab = 'Daily Submissions',
+     xlab = 'Date')
+lines(y = l.f1$f, x = daily_counts$Date[t], type = 'l', col = 'red')
+legend('topright', 50, legend=c("Submissions", "Prediction"),
+       col=c("black", "red"), lty=1:2, cex= 1)
+```
+We have a more refined classical time series approach to forecasting to test alternative methods to. Next, we will try multivariate approaches, which will require some feature engineering. We will experiment with the impact of several engineered variables, but it should be noted that all of the engineered features are derivatives of the primary response variable, daily submissions. Therefore, they will all be endogenous variables that are highly correlated with the predictor variable. The strength of the variables is that they are all highly correlated with daily queue submissions. The weakness of the variables is that they may not add a significant amount of knowlege to our understanding of the primary factors contributing to daily queue submisssions.
+
+##Features to be considered will be daily counts of the following items:
+-submissions that failed
+-count of tasks represented each day (this count reflects the total number of tasks available for online submission)
+-the number of students submitting assessments 
+```{r feature engineering}
+######################################### Engineering Daily Fail Counts
+# RECODING PASS/FAIL
+p_f = ifelse(subset1$Pass.Fail == 'Fail', 1, 0)
+head(p_f)
+subset1$Fail_binary = p_f
+head(subset1$Fail_binary)
+fail_counts = aggregate( subset1$Fail_binary, by = list(subset1$Days) , sum )
+head(fail_counts)
+
+# lengths don't match
+#fail_counts2 = fail_counts %>%
+#  mutate(Group.1 = as.Date(Group.1)) %>%
+#  complete(Group.1 = seq.Date(min(Group.1), max(Group.1), by="day"))
+
+#length(subset1$Pass.Fail)
+# daily coutns and fail counts aren't same length
+# remaking daily_counts
+#daily_counts2 = aggregate( subset1$submit.time, by = list(subset1$Days) , length )
+#length(daily_counts2$x)
+# now they're the same
+
+########################## ENGINEERING DAILY TASK COUNT FEATURE
+
+total_task_counts = aggregate( subset1$Student.Submit.Date, by = list(subset1$Task) , length )
+daily_individual_task_counts = aggregate(subset1$Student.Submit.Date, by = list(subset1$Task, subset1$Days), length)
+daily_total_tasks = aggregate(daily_individual_task_counts$x, by = list(daily_individual_task_counts$Group.2), length)
+
+
+##################### TRYING UNIQUE STUDENT COUNT
+unique_student_submits = aggregate(subset1$submit.time, by = list(subset1$STUDENT_PIDM, subset1$Days), length)
+unique_student_submits2 = aggregate(unique_student_submits$x, by = list(unique_student_submits$Group.2), length)
+```
+```{r visualizing task trends}
+colnames(daily_individual_task_counts) = c('Task', 'Date', 'Count')
+library(ggplot2)
+p = ggplot(daily_individual_task_counts, aes(x=Date, y=Count, group = Task)) +
+  geom_line(aes(color = Task)) +
+  ggtitle('Daily Queue Submissions by Task') +
+  theme(plot.title = element_text(hjust = .5)) +
+  ylab('Submissions') 
+p
+```
+A significant number of task names have changed over time and need to be standardized.
+```{r recoding task names}
+
+```
+```{r daily_counts}
+daily_counts$unique_student_submits = unique_student_submits2$x
+daily_counts$fail_counts = fail_counts$x
+daily_counts$total_tasks = daily_total_tasks$x
+
+colnames(daily_counts) = c('Date', 'submission_count', 'log_sub_count', 'unique_student_submits', 'fail_counts', 'total_tasks')
+head(daily_counts)
+daily_counts = daily_counts[,-7]
+data.frame(daily_counts)
+
+```
+```{r visualizing variables}
+plot(y = daily_counts$submission_count, 
+     x = daily_counts$Date, type = 'l', 
+     main = 'MSDA Daily Queue Counts: 02/21/2017 - 11/18/2019',
+     ylab = "Counts",
+     xlab = 'Time')
+lines(y = daily_counts$unique_student_submits, 
+      x = daily_counts$Date, type = 'l', col = 'blue')
+lines(y = daily_counts$fail_counts,
+      x = daily_counts$Date,
+      type = 'l', col = 'red')
+lines(y = daily_counts$total_tasks,
+      x = daily_counts$Date, type = 'l', col = 'green')
+legend('topleft', legend=c("Submissions", "Student Counts", "Failures", "Number of Tasks"),
+       col=c("black", "blue", "red", "green"), lty=1:2, cex= 1)
+```
+
+```{r examining fail counts}
+#plotts.sample.wge(fail_counts$x)
+ccf(daily_counts$submission_count,daily_counts$fail_counts, lag.max = 32)
+```
+A significant correlation at all lags is present, which reduces the value of this variable and may be an issue with all the engineered variables in this analysis. Fail counts do not appear to be a great predictor of daily queue submissions due to the higher correlation between daily submissions and failures at lag 1. This translates to a higher submission count leading to a higher failure count the next day. Therefore, daily submissions can help predict fail counts. This variable may not prove to be valuable in predicting submissions to the queue. We will proceed to include it in a benchmark Vector Autoregressive model to test its impact on the model's forecasts. 
+```{r examining total task counts}
+#plotts.sample.wge(daily_total_tasks$x)
+ccf(daily_counts$submission_count,daily_counts$unique_student_submits)
+```
+A slightly greater correlation between the number of submissions to the queue and the number of students who submitted assessments at lag 1 is present.
+```{r examining total task counts}
+#plotts.sample.wge(unique_student_submits$x)
+ccf(daily_counts$submission_count,daily_counts$total_tasks)
+```
+
+The results of the CCFs are not highly useful so detrending operations will be performed. We will remove the confirmed 364 seasonal pattern, difference the realizations, then execute the ccfs again. The choice of a first differnce is based on the factor tables of the estimates of both the log transformed data and the raw data containing a very dominant root near the unit circle. 
+```{r detrending}
+## detrending student count
+stud_dt = artrans.wge(daily_counts$unique_student_submits, phi.tr = c(rep(0,363),1))
+d.stud_dt = artrans.wge(stud_dt, 1)
+## detrending fails
+fails_dt = artrans.wge(daily_counts$fail_counts, phi.tr = c(rep(0,363),1))
+d.fails_dt = artrans.wge(fails_dt, 1)
+## detredning tasks
+tasks_dt = artrans.wge(daily_counts$total_tasks, phi.tr = c(rep(0,363),1))
+d.tasks_dt = artrans.wge(tasks_dt, 1)
+ccf(l.s364,d.fails_dt, main = 'Daily Submissions vs. Fail Counts')
+ccf(l.s364,d.stud_dt, main = 'Daily Submissions vs. Student_Counts')
+ccf(l.s364,d.tasks_dt, main = 'Daily Submissions vs. Task Counts')
+```
+The results of the CCF when using de-trended time series are vastly improved. It is clear that daily submission counts are negatively correlated with all three variables at lag 0, and positively correlated with all three variables at lag 1. This supports the assumption that submissions to the queue are predictors of fail counts, the number of students actively contributing submissions, and the total number of tasks worked on. This is due to the fact that these variables are engineered from submissions to the queue.
+
+```{r VAR model identification}
+VAR.dat = daily_counts[1:925,c(2,4:6)]
+VARest = VARselect(VAR.dat, lag.max = 62, type = 'trend', season = 364 )
+VARest$selection 
+```
+The AIC tends to pick the maximum lag allowed. This is possibly due to the derived nature of the engineered variables. Given the daily nature of the series, a maximum lag of 14 will be used.
+```{r benchmark VAR model}
+VAR.dat = daily_counts[1:925,c(2,4:6)]
+
+VARmod = VAR(VAR.dat, p=14, type = 'trend', season = 364)
+VARmod$p
+VAR.fcast = predict(VARmod, n.ahead = 31)
+VAR.preds = VAR.fcast$fcst$submission_count[1:31,1]
+#ase
+month = daily_counts[926:956,2]
+mean((VAR.preds - month)^2) #89.85
+sqrt(mean((VAR.preds - month)^2)) #9.48
+```
+
+
+The benchmark full VAR model performs quite close to the classical ARIMA s = 364 model. We will use the results of the CCF to modify the estimates by using log transformed variables and setting the significant lag to 1.
+```{r VAR lag 1}
+VARmod = VAR(VAR.dat, lag.max = 1, type = 'trend', season = 364)
+VARmod$p
+VAR.fcast = predict(VARmod, n.ahead = 31)
+VAR.preds = VAR.fcast$fcst$submission_count[1:31,1]
+#ase
+month = daily_counts[926:956,2]
+mean((VAR.preds - month)^2) #101.75
+sqrt(mean((VAR.preds - month)^2)) #10.08
+```
+A VAR model with a log transformed response was tried, with displeasing results and will not be considered further. We will proceed to remove features that contribute less to the model.
+
+```{r benchmark VAR model}
+# use unique students & total task count
+VAR.dat = daily_counts[1:925,c(2,4,6)]
+VARmod = VAR(VAR.dat, lag.max = 14, type = 'trend', season = 364)
+VARmod$p # 18
+VAR.fcast = predict(VARmod, n.ahead = 31)
+VAR.preds = VAR.fcast$fcst$submission_count[1:31,1]
+#ase
+month = daily_counts[926:956,2]
+mean((VAR.preds - month)^2) #90.89
+sqrt(mean((VAR.preds - month)^2)) #9.53
+```
+```{r benchmark VAR model}
+# use only task count
+VAR.dat = daily_counts[1:925,c(2,6)]
+VARmod = VAR(VAR.dat, lag.max = 14, type = 'trend', season = 364)
+#VARmod
+VAR.fcast = predict(VARmod, n.ahead = 31)
+VAR.preds = VAR.fcast$fcst$submission_count[1:31,1]
+#ase
+month = daily_counts[926:956,2]
+mean((VAR.preds - month)^2) #96.71
+sqrt(mean((VAR.preds - month)^2)) #9.83
+```
+```{r VAR model}
+# use only student count
+VAR.dat = daily_counts[1:925,c(2,4)]
+
+VARmod = VAR(VAR.dat, lag.max = 14, type = 'trend', season = 364)
+VARmod$p 
+
+VAR.fcast = predict(VARmod, n.ahead = 31)
+VAR.preds = VAR.fcast$fcst$submission_count[1:31,1]
+#ase
+month = daily_counts[926:956,2]
+mean((VAR.preds - month)^2) #89.57
+sqrt(mean((VAR.preds - month)^2)) #9.46
+```
+The best performing model uses only the student count. We will proceed to use this variable.
+```{r mlp benchmark forecast, }
+library(nnfor)
+# identifying the response as submission_counts
+y = ts(daily_counts[1:925,2], frequency = 364)
+# we will set the frequency of the series to 364
+mlp.q = mlp(y, reps = 25)
+mlp.q
+plot(mlp.q)
+```
+```{r benchmark MLP forecast}
+bench_mlp = forecast(mlp.q, h=31)
+plot(bench_mlp) # not helpful visually
+
+t = 926:956
+plot(month, #x = daily_counts$Date[t],
+     type = 'l', main = 'Multi-Layered Perceptron Forecast',
+     xlab = 'Time',
+     ylab = 'Submissions')
+lines(data.frame(bench_mlp$mean), 
+      #x = daily_counts$Date[t],
+      type = 'l', col = 'red')
+legend('topright', legend=c("Submissions", "MLP Forecast"),
+       col=c("black","red"), lty=1:2, cex= 1)
+mean((month - bench_mlp$mean)^2) #ASE 138.37
+sqrt(mean((month - bench_mlp$mean)^2)) #RMSE 11.76
+```
+
+```{r mlp bivariate forecast}
+# we will compare that forecast to a bivariate forecast
+fit1 <- mlp(y,xreg=data.frame(y1))
+print(fit1)
+plot(fit1)
+t = rep(0,30)
+tt = data.frame(ts(c(y,t)))
+mlp.fcast = forecast(fit1,h=30,xreg=tt)
+plot(forecast(fit1,h=30,xreg=tt))
+plot(daily_counts2$x, type = 'l')
+lines(mlp.forecast, type = 'l', col = 'red')
+```
+```{r LSTM}
+library(tidyverse)
+library(glue)
+library(forcats)
+
+# Time Series
+library(timetk)
+library(tidyquant)
+library(tibbletime)
+
+# Visualization
+library(cowplot)
+
+# Preprocessing
+library(recipes)
+
+# Sampling / Accuracy
+library(rsample)
+library(yardstick) 
+
+# Modeling
+library(keras)
+library(tfruns)
+```
+```{r rolling origin}
+########################### BACKTESTING
+
+# turning q.counts into time series
+
+str(daily_counts)
+
+q.counts <- daily_counts[,1:2]
+q.counts =   q.counts %>%
+  tk_tbl() %>%
+  mutate(index = as_date(Date)) %>%
+  as_tbl_time(index = index)
+
+
+
+colnames(q.counts) = c('Date', 'index', 'value')
+
+str(q.counts)
+
+
+periods_train <- 750 # establishes the size of training sets @ 750
+periods_test  <- 124 # establishes the size of the test sets @ 124 observations each
+skip_span     <- 31 # establishes a separation between the training and test sets of 31 observations
+# here, skip span is used to create an even distribution of train-test sets across the entire 956 observations
+
+#rolling_origin will resample your series given a train and test time spans
+# an added option is to skip a number of observations before taking another train time span
+rolling_origin_resamples <- rolling_origin(
+  q.counts,
+  initial    = periods_train,
+  assess     = periods_test,
+  cumulative = FALSE,
+  skip       = skip_span
+)
+
+rolling_origin_resamples
+
+
+###### visualizing backtesting
+# Plotting function for a single split
+plot_split <- function(split, expand_y_axis = TRUE, 
+                       alpha = 1, size = 1, base_size = 14) {
+  
+  # Manipulate data
+  train_tbl <- training(split) %>%
+    add_column(key = "training") 
+  
+  test_tbl  <- testing(split) %>%
+    add_column(key = "testing") 
+  
+  data_manipulated <- bind_rows(train_tbl, test_tbl) %>%
+    as_tbl_time(index = index) %>%
+    mutate(key = fct_relevel(key, "training", "testing"))
+  
+  # Collect attributes
+  train_time_summary <- train_tbl %>%
+    tk_index() %>%
+    tk_get_timeseries_summary()
+  
+  test_time_summary <- test_tbl %>%
+    tk_index() %>%
+    tk_get_timeseries_summary()
+  
+  # Visualize
+  g <- data_manipulated %>%
+    ggplot(aes(x = index, y = value, color = key)) +
+    geom_line(size = size, alpha = alpha) +
+    theme_tq(base_size = base_size) +
+    scale_color_tq() +
+    labs(
+      title    = glue("Split: {split$id}"),
+      subtitle = glue("{train_time_summary$start} to ", 
+                      "{test_time_summary$end}"),
+      y = "", x = ""
+    ) +
+    theme(legend.position = "none") 
+  
+  if (expand_y_axis) {
+    
+    q.counts_time_summary <- q.counts %>% 
+      tk_index() %>% 
+      tk_get_timeseries_summary()
+    
+    g <- g +
+      scale_x_date(limits = c(q.counts_time_summary$start, 
+                              q.counts_time_summary$end))
+  }
+  
+  g
+}
+
+rolling_origin_resamples$splits[[1]] %>%
+  plot_split(expand_y_axis = TRUE) +
+  theme(legend.position = "bottom")
+```
+```{r}
+plot_sampling_plan <- function(sampling_tbl, expand_y_axis = TRUE, 
+                               ncol = 3, alpha = 1, size = 1, base_size = 14, 
+                               title = "Sampling Plan") {
+  
+  # Map plot_split() to sampling_tbl
+  sampling_tbl_with_plots <- sampling_tbl %>%
+    mutate(gg_plots = map(splits, plot_split, 
+                          expand_y_axis = expand_y_axis,
+                          alpha = alpha, base_size = base_size))
+  
+  # Make plots with cowplot
+  plot_list <- sampling_tbl_with_plots$gg_plots 
+  
+  p_temp <- plot_list[[1]] + theme(legend.position = "bottom")
+  legend <- get_legend(p_temp)
+  
+  p_body  <- plot_grid(plotlist = plot_list, ncol = ncol)
+  
+  p_title <- ggdraw() + 
+    draw_label(title, size = 14, fontface = "bold", 
+               colour = palette_light()[[1]])
+  
+  g <- plot_grid(p_title, p_body, legend, ncol = 1, 
+                 rel_heights = c(0.05, 1, 0.05))
+  
+  g
+  
+}
+
+rolling_origin_resamples$splits[[1]] %>%
+  plot_split(expand_y_axis = TRUE) +
+  theme(legend.position = "bottom")
+
+plot_sampling_plan <- function(sampling_tbl, expand_y_axis = TRUE, 
+                               ncol = 3, alpha = 1, size = 1, base_size = 14, 
+                               title = "Sampling Plan") {
+  
+  # Map plot_split() to sampling_tbl
+  sampling_tbl_with_plots <- sampling_tbl %>%
+    mutate(gg_plots = map(splits, plot_split, 
+                          expand_y_axis = expand_y_axis,
+                          alpha = alpha, base_size = base_size))
+  
+  # Make plots with cowplot
+  plot_list <- sampling_tbl_with_plots$gg_plots 
+  
+  p_temp <- plot_list[[1]] + theme(legend.position = "bottom")
+  legend <- get_legend(p_temp)
+  
+  p_body  <- plot_grid(plotlist = plot_list, ncol = ncol)
+  
+  p_title <- ggdraw() + 
+    draw_label(title, size = 14, fontface = "bold", 
+               colour = palette_light()[[1]])
+  
+  g <- plot_grid(p_title, p_body, legend, ncol = 1, 
+                 rel_heights = c(0.05, 1, 0.05))
+  
+  g
+  
+}
+
+rolling_origin_resamples %>%
+  plot_sampling_plan(expand_y_axis = T, ncol = 3, alpha = 1, size = 1, base_size = 10, 
+                     title = "Backtesting Strategy: Rolling Origin Sampling Plan")
+```
+```{r LSTM MODEL}
+example_split    <- rolling_origin_resamples$splits[[5]]
+example_split_id <- rolling_origin_resamples$id[[5]]
+
+plot_split(example_split, expand_y_axis = FALSE, size = 0.5) +
+  theme(legend.position = "bottom") +
+  ggtitle(glue("Split: {example_split_id}"))
+
+df_trn <- analysis(example_split)[1:495, , drop = FALSE] 
+df_val <- analysis(example_split)[496:750, , drop = FALSE] 
+df_tst <- assessment(example_split) 
+
+df <- bind_rows(
+  df_trn %>% add_column(key = "training"),
+  df_val %>% add_column(key = "validation"),
+  df_tst %>% add_column(key = "testing")
+) %>%
+  as_tbl_time(index = index)
+
+df
+
+## preprocessing
+rec_obj <- recipe(value ~ ., df) %>%
+  step_sqrt(value) %>%
+  step_center(value) %>%
+  step_scale(value) %>%
+  prep()
+
+df_processed_tbl <- bake(rec_obj, df)
+
+df_processed_tbl
+
+
+center_history <- rec_obj$steps[[2]]$means["value"]
+scale_history  <- rec_obj$steps[[3]]$sds["value"]
+
+c("center" = center_history, "scale" = scale_history)
+
+
+######### RESHAPING THE DATA
+# these variables are being defined just because of the order in which
+# we present things in this post (first the data, then the model)
+# they will be superseded by FLAGS$n_timesteps, FLAGS$batch_size and n_predictions
+# in the following snippet
+n_timesteps <- 10
+n_predictions <- n_timesteps
+batch_size <- 10
+
+# functions used
+build_matrix <- function(tseries, overall_timesteps) {
+  t(sapply(1:(length(tseries) - overall_timesteps + 1), function(x) 
+    tseries[x:(x + overall_timesteps - 1)]))
+}
+
+reshape_X_3d <- function(X) {
+  dim(X) <- c(dim(X)[1], dim(X)[2], 1)
+  X
+}
+
+# extract values from data frame
+train_vals <- df_processed_tbl %>%
+  filter(key == "training") %>%
+  dplyr::select(value) %>%
+  pull()
+valid_vals <- df_processed_tbl %>%
+  filter(key == "validation") %>%
+  dplyr::select(value) %>%
+  pull()
+test_vals <- df_processed_tbl %>%
+  filter(key == "testing") %>%
+  dplyr::select(value) %>%
+  pull()
+
+
+# build the windowed matrices
+train_matrix <-
+  build_matrix(train_vals, n_timesteps + n_predictions)
+valid_matrix <-
+  build_matrix(valid_vals, n_timesteps + n_predictions)
+test_matrix <- 
+  build_matrix(test_vals, n_timesteps + n_predictions)
+
+# separate matrices into training and testing parts
+# also, discard last batch if there are fewer than batch_size samples
+# (a purely technical requirement)
+X_train <- train_matrix[, 1:n_timesteps]
+y_train <- train_matrix[, (n_timesteps + 1):(n_timesteps * 2)]
+X_train <- X_train[1:(nrow(X_train) %/% batch_size * batch_size), ]
+y_train <- y_train[1:(nrow(y_train) %/% batch_size * batch_size), ]
+
+X_valid <- valid_matrix[, 1:n_timesteps]
+y_valid <- valid_matrix[, (n_timesteps + 1):(n_timesteps * 2)]
+X_valid <- X_valid[1:(nrow(X_valid) %/% batch_size * batch_size), ]
+y_valid <- y_valid[1:(nrow(y_valid) %/% batch_size * batch_size), ]
+
+X_test <- test_matrix[, 1:n_timesteps]
+y_test <- test_matrix[, (n_timesteps + 1):(n_timesteps * 2)]
+X_test <- X_test[1:(nrow(X_test) %/% batch_size * batch_size), ]
+y_test <- y_test[1:(nrow(y_test) %/% batch_size * batch_size), ]
+# add on the required third axis
+X_train <- reshape_X_3d(X_train)
+X_valid <- reshape_X_3d(X_valid)
+X_test <- reshape_X_3d(X_test)
+
+y_train <- reshape_X_3d(y_train)
+y_valid <- reshape_X_3d(y_valid)
+y_test <- reshape_X_3d(y_test)
+```
+```{r running model}
+############ BUILDING THE LSTM MODEL
+FLAGS <- flags(
+  # There is a so-called "stateful LSTM" in Keras. While LSTM is stateful
+  # per se, this adds a further tweak where the hidden states get 
+  # initialized with values from the item at same position in the previous
+  # batch. This is helpful just under specific circumstances, or if you want
+  # to create an "infinite stream" of states, in which case you'd use 1 as 
+  # the batch size. Below, we show how the code would have to be changed to
+  # use this, but it won't be further discussed here.
+  flag_boolean("stateful", FALSE),
+  # Should we use several layers of LSTM?
+  # Again, just included for completeness, it did not yield any superior 
+  # performance on this task.
+  # This will actually stack exactly one additional layer of LSTM units.
+  flag_boolean("stack_layers", FALSE),
+  # number of samples fed to the model in one go
+  flag_integer("batch_size", 10),
+  # size of the hidden state, equals size of predictions
+  flag_integer("n_timesteps", 10),
+  # how many epochs to train for
+  flag_integer("n_epochs", 50),
+  # fraction of the units to drop for the linear transformation of the inputs
+  flag_numeric("dropout", 0.2),
+  # fraction of the units to drop for the linear transformation of the 
+  # recurrent state
+  flag_numeric("recurrent_dropout", 0.2),
+  # loss function. Found to work better for this specific case than mean
+  # squared error
+  flag_string("loss", "logcosh"),
+  # optimizer = stochastic gradient descent. Seemed to work better than adam 
+  # or rmsprop here (as indicated by limited testing)
+  flag_string("optimizer_type", "sgd"),
+  # size of the LSTM layer
+  flag_integer("n_units", 128),
+  # learning rate
+  flag_numeric("lr", 0.003),
+  # momentum, an additional parameter to the SGD optimizer
+  flag_numeric("momentum", 0.9),
+  # parameter to the early stopping callback
+  flag_integer("patience", 10)
+)
+
+# the number of predictions we'll make equals the length of the hidden state
+n_predictions <- FLAGS$n_timesteps
+# how many features = predictors we have
+n_features <- 1
+# just in case we wanted to try different optimizers, we could add here
+optimizer <- switch(FLAGS$optimizer_type,
+                    sgd = optimizer_sgd(lr = FLAGS$lr, 
+                                        momentum = FLAGS$momentum)
+)
+
+# callbacks to be passed to the fit() function
+# We just use one here: we may stop before n_epochs if the loss on the
+# validation set does not decrease (by a configurable amount, over a 
+# configurable time)
+callbacks <- list(
+  callback_early_stopping(patience = FLAGS$patience)
+)
+```
+```{r training model}
+# create the model
+model <- keras_model_sequential()
+
+# add layers
+# we have just two, the LSTM and the time_distributed 
+model %>%
+  layer_lstm(
+    units = FLAGS$n_units, 
+    # the first layer in a model needs to know the shape of the input data
+    batch_input_shape  = c(FLAGS$batch_size, FLAGS$n_timesteps, n_features),
+    dropout = FLAGS$dropout,
+    recurrent_dropout = FLAGS$recurrent_dropout,
+    # by default, an LSTM just returns the final state
+    return_sequences = TRUE
+  ) %>% time_distributed(layer_dense(units = 1))
+
+model %>%
+  compile(
+    loss = FLAGS$loss,
+    optimizer = optimizer,
+    # in addition to the loss, Keras will inform us about current 
+    # MSE while training
+    metrics = list("mean_squared_error")
+  )
+
+history <- model %>% fit(
+  x          = X_train,
+  y          = y_train,
+  validation_data = list(X_valid, y_valid),
+  batch_size = FLAGS$batch_size,
+  epochs     = FLAGS$n_epochs,
+  callbacks = callbacks
+)
+
+
+############### TESTING MODEL
+pred_train <- model %>%
+  predict(X_train, batch_size = FLAGS$batch_size) %>%
+  .[, , 1]
+
+# Retransform values to original scale
+pred_train <- (pred_train * scale_history + center_history) ^2
+compare_train <- df %>% filter(key == "training")
+
+# build a dataframe that has both actual and predicted values
+for (i in 1:nrow(pred_train)) {
+  varname <- paste0("pred_train", i)
+  compare_train <-
+    mutate(compare_train,!!varname := c(
+      rep(NA, FLAGS$n_timesteps + i - 1),
+      pred_train[i,],
+      rep(NA, nrow(compare_train) - FLAGS$n_timesteps * 2 - i + 1)
+    ))
+}
+
+# test set 
+pred_test <- model %>% 
+  predict(X_test, batch_size = FLAGS$batch_size) %>% 
+  .[, , 1]
+#retransform values to original scale
+pred_test <- (pred_test * scale_history + center_history) ^ 2
+compare_test <- df %>% 
+  filter(key == "testing")
+#build a dataframe that has both actual and predicted values
+for(i in 1:nrow(pred_test)) {
+  varname <- paste0("pred_test", i)
+  compare_test <- 
+    mutate(compare_test, !!varname := c(
+      rep(NA, FLAGS$n_timesteps + i - 1), 
+      pred_test[i, ], 
+      rep(NA, nrow(compare_test) - FLAGS$n_timesteps * 2 - i + 1)
+    ))
+}
+list(train = compare_train, test = compare_test)
+```
+```{r}
+############################### VISUALIZING Training Predictions
+compare_train %>% 
+  ggplot(aes(x = index, y = value)) + 
+  geom_line() + 
+  geom_line(aes(y = pred_train1), color = "cyan") + 
+  geom_line(aes(y = pred_train10), color = "red") + 
+  geom_line(aes(y = pred_train20), color = "green") + 
+  geom_line(aes(y = pred_train30), color = "violet") + 
+  geom_line(aes(y = pred_train40), color = "cyan") + 
+  geom_line(aes(y = pred_train50), color = "red") + 
+  geom_line(aes(y = pred_train60), color = "green") + 
+  geom_line(aes(y = pred_train70), color = "violet") + 
+  ggtitle("Predictions on the training set")
+############################### VISUALIZING Testing Predictions
+compare_test %>% 
+  ggplot(aes(x = index, y = value)) + 
+  geom_line() + 
+  geom_line(aes(y = pred_test1), color = "cyan") + 
+  geom_line(aes(y = pred_test5), color = "red") + 
+  geom_line(aes(y = pred_test10), color = "green") + 
+
+
+  ggtitle("Predictions on the testing set")
+```
